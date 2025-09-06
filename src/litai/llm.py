@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 import requests
 from lightning_sdk.lightning_cloud.openapi import V1ConversationResponseChunk
 from lightning_sdk.llm import LLM as SDKLLM
+from pydantic import BaseModel
 
 from litai.tools import LitTool
 from litai.utils.supported_public_models import ModelLiteral
@@ -358,7 +359,7 @@ class LLM:
     @staticmethod
     def call_tool(
         response: Union[List[dict], dict, str], tools: Optional[Sequence[Union[LitTool, "StructuredTool"]]] = None
-    ) -> Optional[str]:
+    ) -> Optional[Union[str, BaseModel, list[BaseModel]]]:
         """Calls a tool with the given response."""
         if tools is None:
             raise ValueError("No tools provided")
@@ -398,7 +399,75 @@ class LLM:
         if len(results) == 0:
             return None
 
-        return json.dumps(results) if len(results) > 1 else results[0]
+        try:
+            return json.dumps(results) if len(results) > 1 else results[0]
+        except TypeError:
+            return results if len(results) > 1 else results[0]
+
+    def predict(  # noqa: D417
+        self,
+        prompt: str,
+        contracts: Sequence[type[BaseModel]],
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        max_tokens: int = 500,
+        images: Optional[Union[List[str], str]] = None,
+        conversation: Optional[str] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        stream: bool = False,
+        auto_call_tools: bool = False,
+        **kwargs: Any,
+    ) -> Optional[Union[BaseModel, list[BaseModel]]]:
+        """Sends a message to the LLM and retrieves a structured response based on the provided Pydantic models."""
+        tools = [LitTool.from_model(c) for c in contracts]
+        response = self.chat(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model=model,
+            max_tokens=max_tokens,
+            images=images,
+            conversation=conversation,
+            metadata=metadata,
+            stream=stream,
+            tools=tools,
+            auto_call_tools=auto_call_tools,
+            **kwargs,
+        )
+        # Call tool(s) with the given response.
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except json.JSONDecodeError:
+                raise ValueError("Tool response is not a valid JSON string")
+
+        results = []
+        if isinstance(response, dict):
+            response = [response]
+
+        for tool_response in response:
+            if not isinstance(tool_response, dict):
+                continue
+            tool_name = tool_response.get("function", {}).get("name")
+            if not tool_name:
+                continue
+            tool_args = tool_response.get("function", {}).get("arguments", {})
+            if isinstance(tool_args, str):
+                try:
+                    tool_args = json.loads(tool_args)
+                except json.JSONDecodeError:
+                    print(f"❌ Failed to parse tool arguments: {tool_args}")
+                    return None
+            if isinstance(tool_args, dict):
+                tool_args = {k: v for k, v in tool_args.items() if v is not None}
+
+            for tool in tools:
+                if tool.name == tool_name:
+                    results.append(tool.run(**tool_args))
+
+        if len(results) == 0:
+            return None
+
+        return results if len(results) > 1 else results[0]
 
     def _dump_debug(
         self,
